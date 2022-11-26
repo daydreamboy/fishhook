@@ -36,6 +36,11 @@
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 
+#include <stdio.h>
+#include <time.h>
+
+#define DEBUG_FISHHOOK 0
+
 #ifdef __LP64__
 typedef struct mach_header_64 mach_header_t;
 typedef struct segment_command_64 segment_command_t;
@@ -62,6 +67,15 @@ struct rebindings_entry {
 
 static struct rebindings_entry *_rebindings_head;
 
+/**
+ Initialize the rebindings_head pointer and prepend new bind list to the head
+ 
+ @param rebindings_head the pointer for initializing
+ @param rebindings the rebind model list
+ @param nel the number of rebind models
+ 
+ @discussion copy rebindings list from stack to heap
+ */
 static int prepend_rebindings(struct rebindings_entry **rebindings_head,
                               struct rebinding rebindings[],
                               size_t nel) {
@@ -116,7 +130,7 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
                                            intptr_t slide,
                                            nlist_t *symtab,
                                            char *strtab,
-                                           uint32_t *indirect_symtab) {
+                                           uint32_t *indirect_symtab, Dl_info info) {
   uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1;
   void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
 
@@ -153,7 +167,18 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
              * iOS 15 has corrected the const segments prot.
              * -- Lionfore Hao Jun 11th, 2021
              **/
+#if DEBUG_FISHHOOK
+            printf("sect:%s,%s\n", section->segname, section->sectname);
+#endif
             indirect_symbol_bindings[i] = cur->rebindings[j].replacement;
+              
+#if DEBUG_FISHHOOK
+              printf("dli_fname: %s\n", info.dli_fname); /* Pathname of shared object */
+              printf("dli_fbase: %p\n", info.dli_fbase); /* Base address of shared object */
+              printf("dli_sname: %s\n", info.dli_sname); /* Name of nearest symbol */
+              printf("dli_saddr: %p\n", info.dli_saddr); /* Address of nearest symbol */
+              printf("--------\n");
+#endif
           }
           goto symbol_loop;
         }
@@ -168,6 +193,7 @@ static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
                                      const struct mach_header *header,
                                      intptr_t slide) {
   Dl_info info;
+    // Note: if error happened in dladdr, it return 0
   if (dladdr(header, &info) == 0) {
     return;
   }
@@ -177,6 +203,10 @@ static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
   struct symtab_command* symtab_cmd = NULL;
   struct dysymtab_command* dysymtab_cmd = NULL;
 
+    // Note: search load commands for the three load commands
+    // - linkedit_segment (load command)
+    // - symtab_cmd (load command)
+    // - dysymtab_cmd (load command)
   uintptr_t cur = (uintptr_t)header + sizeof(mach_header_t);
   for (uint i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
     cur_seg_cmd = (segment_command_t *)cur;
@@ -204,6 +234,7 @@ static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
   // Get indirect symbol table (array of uint32_t indices into symbol table)
   uint32_t *indirect_symtab = (uint32_t *)(linkedit_base + dysymtab_cmd->indirectsymoff);
 
+    // Note: search for SEG_DATA or SEG_DATA_CONST
   cur = (uintptr_t)header + sizeof(mach_header_t);
   for (uint i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
     cur_seg_cmd = (segment_command_t *)cur;
@@ -215,21 +246,46 @@ static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
       for (uint j = 0; j < cur_seg_cmd->nsects; j++) {
         section_t *sect =
           (section_t *)(cur + sizeof(segment_command_t)) + j;
+          
+          // Note: filter out the sections, S_LAZY_SYMBOL_POINTERS or S_NON_LAZY_SYMBOL_POINTERS
         if ((sect->flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS) {
-          perform_rebinding_with_section(rebindings, sect, slide, symtab, strtab, indirect_symtab);
+          perform_rebinding_with_section(rebindings, sect, slide, symtab, strtab, indirect_symtab, info);
         }
         if ((sect->flags & SECTION_TYPE) == S_NON_LAZY_SYMBOL_POINTERS) {
-          perform_rebinding_with_section(rebindings, sect, slide, symtab, strtab, indirect_symtab);
+          perform_rebinding_with_section(rebindings, sect, slide, symtab, strtab, indirect_symtab, info);
         }
       }
     }
   }
 }
 
+#pragma mark - image load callback
+
 static void _rebind_symbols_for_image(const struct mach_header *header,
                                       intptr_t slide) {
+    
+#if DEBUG_FISHHOOK
+    static double totalTime = 0;
+    
+    // @see https://stackoverflow.com/questions/5248915/execution-time-of-c-program
+    clock_t begin = clock();
+#endif
+  
     rebind_symbols_for_image(_rebindings_head, header, slide);
+  
+#if DEBUG_FISHHOOK
+    clock_t end = clock();
+    double duration = (double)(end - begin) / CLOCKS_PER_SEC;
+    
+    //printf("duration: %f\n", duration);
+    
+    totalTime += duration;
+    
+    printf("totalTime: %f\n", totalTime);
+#endif
 }
+
+#pragma mark -
 
 int rebind_symbols_image(void *header,
                          intptr_t slide,
@@ -250,13 +306,24 @@ int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel) {
   if (retval < 0) {
     return retval;
   }
+    // Note: the first time, _rebindings_head->next is NULL, add callback for handle rebind symbols.
+    // Otherwise, handle rebind symbols for existing images
   // If this was the first call, register callback for image additions (which is also invoked for
   // existing images, otherwise, just run on existing images
   if (!_rebindings_head->next) {
+#if DEBUG_FISHHOOK
+    printf("_dyld_register_func_for_add_image\n");
+#endif
     _dyld_register_func_for_add_image(_rebind_symbols_for_image);
   } else {
+#if DEBUG_FISHHOOK
+    printf("_rebind_symbols_for_image\n");
+#endif
     uint32_t c = _dyld_image_count();
     for (uint32_t i = 0; i < c; i++) {
+#if DEBUG_FISHHOOK
+      printf("image name: %s", _dyld_get_image_name(i));
+#endif
       _rebind_symbols_for_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
     }
   }
