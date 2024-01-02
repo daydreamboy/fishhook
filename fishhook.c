@@ -285,12 +285,9 @@ static void _rebind_symbols_for_image(const struct mach_header *header,
 #endif
 }
 
-#pragma mark -
+#pragma mark - Public Functions
 
-int rebind_symbols_image(void *header,
-                         intptr_t slide,
-                         struct rebinding rebindings[],
-                         size_t rebindings_nel) {
+int FishFunctionPrefixed(rebind_symbols_image(void *header, intptr_t slide, struct rebinding rebindings[], size_t rebindings_nel)) {
     struct rebindings_entry *rebindings_head = NULL;
     int retval = prepend_rebindings(&rebindings_head, rebindings, rebindings_nel);
     rebind_symbols_for_image(rebindings_head, (const struct mach_header *) header, slide);
@@ -301,7 +298,7 @@ int rebind_symbols_image(void *header,
     return retval;
 }
 
-int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel) {
+int FishFunctionPrefixed(rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel)) {
   int retval = prepend_rebindings(&_rebindings_head, rebindings, rebindings_nel);
   if (retval < 0) {
     return retval;
